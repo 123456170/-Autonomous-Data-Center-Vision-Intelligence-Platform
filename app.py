@@ -1,38 +1,23 @@
 """
 ================================================================================
- AUTONOMOUS DATA CENTER VISION INTELLIGENCE PLATFORM  (v1.1 - motion fix)
+ AUTONOMOUS DATA CENTER VISION INTELLIGENCE PLATFORM  (v2 - Streamlit Cloud fix)
 ================================================================================
- Production-style multi-agent computer-vision system for real-time monitoring
- of data-center floors: technicians, equipment, racks, doors, safety hazards
- and restricted zones.
+ DEPLOYMENT FIXES (why motion now works on Streamlit Community Cloud):
+   * No blocking while-loop. Rendering runs inside st.fragment(run_every=...),
+     the Streamlit-native scheduling model (cloud-safe, no stalled threads).
+   * Frames are JPEG-encoded (~60 KB) instead of raw PNG (~1.5 MB) -> the
+     websocket can sustain the stream on throttled cloud CPUs.
+   * 960x540 demo resolution (wall-clock animation keeps speed correct).
+   * Fallback for old Streamlit versions: full-script autorefresh.
 
- QUICKSTART
- ----------
-     pip install -r requirements.txt
-     streamlit run app.py
+ RUN LOCALLY:      pip install -r requirements.txt && streamlit run app.py
+ DEPLOY TO CLOUD:  use the slim requirements-cloud.txt (no torch/ultralytics),
+                   repo layout: app.py, requirements.txt, .streamlit/config.toml
 
- The app boots directly into LIVE DEMO MODE: a procedurally-rendered data-hall
- scene drives the entire agent pipeline (Vision -> Tracking -> Zone -> Event ->
- Risk -> Investigation -> Reporting), so the dashboard is never blank, even
- without a camera, GPU, or model weights.
+ SAFETY & PRIVACY: detections are observations only; no identity or access
+ control decisions from appearance; human oversight always required.
 
- FIXES IN THIS VERSION
- ---------------------
-   * Demo actors animate on WALL-CLOCK time (never stalls with loop timing).
-   * Faster, clearly visible motion + walking bob + HUD frame counter.
-   * Render loop is exception-safe (errors are shown, not silently frozen).
-   * Tracker cleanup + file-upload path fixed.
-
- SAFETY & PRIVACY POLICY
- -----------------------
- Visual detections are OBSERVATIONS only. No identity or access-control
- decision is ever made from appearance alone; zone-entry events always request
- credential verification and human oversight.
-
- DATABASE (PostgreSQL-ready)
- ---------------------------
- Set env  DATABASE_URL=postgresql://user:pass@host:5432/dcvision  to use
- PostgreSQL; otherwise a local SQLite file is used. Schema auto-created.
+ DATABASE: set DATABASE_URL=postgresql://... for PostgreSQL (else SQLite).
 ================================================================================
 """
 
@@ -54,9 +39,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# --------------------------------------------------------------------------
-# Optional heavy dependencies (graceful fallbacks everywhere)
-# --------------------------------------------------------------------------
 try:
     from sqlalchemy import (
         Column, DateTime, Float, Integer, MetaData, String, Table, Text,
@@ -73,7 +55,7 @@ except Exception:
     YOLO_OK = False
 
 try:
-    import av  # PyAV fallback decoder
+    import av
     AV_OK = True
 except Exception:
     AV_OK = False
@@ -87,7 +69,7 @@ CONFIG = {
     "default_camera": "CAM-01",
     "database_url": os.environ.get("DATABASE_URL", "sqlite:///datacenter_vision.db"),
     "demo_fps": 24,
-    "demo_size": (1280, 720),
+    "demo_size": (960, 540),          # lighter frame = smooth on cloud CPUs
     "timeline_max": 600,
     "active_event_window_s": 45,
     "zones": [
@@ -103,13 +85,9 @@ CONFIG = {
          "poly": [(0.32, 0.56), (0.52, 0.56), (0.52, 0.96), (0.32, 0.96)]},
     ],
     "thresholds": {
-        "restricted_dwell_s": 10.0,
-        "door_open_s": 10.0,
-        "unattended_s": 8.0,
-        "unattended_radius": 150.0,
-        "crowd_count": 4,
-        "crowd_persist_s": 2.5,
-        "abnormal_speed": 300.0,   # px/s
+        "restricted_dwell_s": 10.0, "door_open_s": 10.0, "unattended_s": 8.0,
+        "unattended_radius": 150.0, "crowd_count": 4, "crowd_persist_s": 2.5,
+        "abnormal_speed": 300.0,
     },
     "cooldown_s": {
         "unauthorized_zone_entry": 20, "extended_presence": 25, "door_left_open": 20,
@@ -243,8 +221,19 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+def encode_jpg(frame, quality=72):
+    """JPEG keeps frames ~60KB (PNG would be ~1.5MB) — critical on cloud."""
+    try:
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+        if ok:
+            return buf.tobytes()
+    except Exception:
+        pass
+    return frame
+
+
 # --------------------------------------------------------------------------
-# SYNTHETIC DATA-CENTER SCENE  (wall-clock animated — never stalls)
+# SYNTHETIC DATA-CENTER SCENE (wall-clock animated)
 # --------------------------------------------------------------------------
 SCENARIOS = [
     ("NORMAL OPERATIONS", 16),
@@ -260,7 +249,7 @@ class SyntheticScene:
     FLOOR = (34, 28, 22)
     GRID = (48, 40, 32)
 
-    def __init__(self, w=1280, h=720, fps=24, camera="CAM-01", seed=7):
+    def __init__(self, w=960, h=540, fps=24, camera="CAM-01", seed=7):
         self.W, self.H, self.fps, self.camera = w, h, fps, camera
         self.rng = random.Random(seed)
         self.frame_idx = 0
@@ -269,8 +258,8 @@ class SyntheticScene:
         self.scenario_t = 0.0
         self.actors: List[Dict] = []
         self._actor_seq = 0
-        self.speed_mult = 1.0                      # user-adjustable demo speed
-        self._last = time.time()                   # WALL-CLOCK animation base
+        self.speed_mult = 1.0
+        self._last = time.time()
         self.doors = {
             "R1": {"label": "R1 // RESTRICTED", "rel": (0.70, 0.78, 0.42), "open": False,
                    "open_for": 0.0, "open_target": 2.0},
@@ -281,7 +270,6 @@ class SyntheticScene:
         self._noise = np.random.randint(0, 9, (h, w), dtype=np.uint8)
         self._spawn_scenario(0)
 
-    # ---------------- setup ----------------
     def _build_racks(self):
         self.racks = []
 
@@ -323,37 +311,33 @@ class SyntheticScene:
         cor = (0.33, 0.58, 0.51, 0.94)
         mnt = (0.58, 0.60, 0.94, 0.92)
 
-        if idx == 0:    # normal ops — busy floor
+        if idx == 0:
             self._add_actor("technician", 0.15, 0.30, 115, home=srv)
             self._add_actor("technician", 0.40, 0.70, 120, home=cor)
             self._add_actor("technician", 0.30, 0.42, 105, home=srv)
             self._add_actor("cart", 0.42, 0.85, 90, home=cor)
             self._add_actor("toolbox", 0.20, 0.40, 34, home=srv)
-        elif idx == 1:  # restricted breach
+        elif idx == 1:
             self._add_actor("technician", 0.15, 0.25, 110, home=srv)
             self._add_actor("technician", 0.60, 0.50, 125, authorized=False,
                             wps=[(0.64 * self.W, 0.38 * self.H),
                                  (0.78 * self.W, 0.20 * self.H)])
-        elif idx == 2:  # door left open
+        elif idx == 2:
             self.doors["R1"]["open"] = True
-            self._add_actor("technician", 0.66, 0.50, 100,
-                            home=(0.58, 0.44, 0.92, 0.54))
-            self._add_actor("cart", 0.80, 0.50, 85,
-                            home=(0.58, 0.44, 0.92, 0.54))
-        elif idx == 3:  # unattended toolbox
+            self._add_actor("technician", 0.66, 0.50, 100, home=(0.58, 0.44, 0.92, 0.54))
+            self._add_actor("cart", 0.80, 0.50, 85, home=(0.58, 0.44, 0.92, 0.54))
+        elif idx == 3:
             self._add_actor("toolbox", 0.42, 0.76, 0.0)
-            a = self._add_actor("technician", 0.43, 0.74, 115,
-                                wps=[(0.36 * self.W, 0.60 * self.H),
-                                     (0.18 * self.W, 0.30 * self.H)]) or None
-            self.actors[-1]["home"] = srv
+            self._add_actor("technician", 0.43, 0.74, 115, home=srv,
+                            wps=[(0.36 * self.W, 0.60 * self.H),
+                                 (0.18 * self.W, 0.30 * self.H)])
             self._add_actor("technician", 0.10, 0.20, 105, home=srv)
-        elif idx == 4:  # crowding
+        elif idx == 4:
             for _ in range(5):
                 self._add_actor("technician",
                                 0.34 + self.rng.random() * 0.15,
-                                0.62 + self.rng.random() * 0.28,
-                                70, home=cor)
-        elif idx == 5:  # runner + PPE fault
+                                0.62 + self.rng.random() * 0.28, 70, home=cor)
+        elif idx == 5:
             self._add_actor("technician", 0.34, 0.92, 380,
                             wps=[(0.34 * self.W, 0.60 * self.H),
                                  (0.50 * self.W, 0.60 * self.H),
@@ -361,7 +345,6 @@ class SyntheticScene:
                                  (0.34 * self.W, 0.93 * self.H)])
             self._add_actor("technician", 0.70, 0.75, 95, home=mnt, helmet=False)
 
-    # ---------------- step (wall-clock dt) ----------------
     def step(self):
         now = time.time()
         dt = clamp(now - self._last, 0.0, 0.10) * max(0.0, self.speed_mult)
@@ -377,7 +360,6 @@ class SyntheticScene:
             self.scenario_t = 0.0
             self._spawn_scenario(self.scenario_idx)
 
-        # doors lifecycle
         for d in self.doors.values():
             if d["open"]:
                 d["open_for"] += dt
@@ -387,7 +369,6 @@ class SyntheticScene:
                 d["open"] = True
                 d["open_target"] = 2.0 + self.rng.random() * 2.5
 
-        # ---- actor movement (this is what animates technicians/equipment) ----
         for a in self.actors:
             target = None
             if a["wps"]:
@@ -404,7 +385,6 @@ class SyntheticScene:
                 if not wp or (a["x"] - wp[0]) ** 2 + (a["y"] - wp[1]) ** 2 < 100:
                     a["_wp"] = self._wander(*a["home"])
                 target = a["_wp"]
-
             if target and a["speed"] > 0:
                 dx, dy = target[0] - a["x"], target[1] - a["y"]
                 dist = max(1e-3, (dx * dx + dy * dy) ** 0.5)
@@ -430,7 +410,6 @@ class SyntheticScene:
                 attrs={"authorized": a["authorized"], "helmet": a["helmet"]}))
         return out
 
-    # ---------------- rendering ----------------
     def _render(self):
         W, H = self.W, self.H
         img = np.full((H, W, 3), self.FLOOR, dtype=np.uint8)
@@ -469,7 +448,6 @@ class SyntheticScene:
         for a in self.actors:
             self._draw_actor(img, a)
 
-        # moving noise shimmer — extra proof the feed is live
         roll = (self.frame_idx * 7) % 64
         noise = np.roll(self._noise, roll, axis=1)
         img = cv2.add(img, cv2.cvtColor(noise, cv2.COLOR_GRAY2BGR) // 4)
@@ -595,7 +573,7 @@ class VisionAgent:
             except Exception as e:
                 self.detector_status = f"YOLO unavailable ({type(e).__name__}) — raw feed only"
         else:
-            self.detector_status = "Ultralytics not installed — raw feed only"
+            self.detector_status = "Ultralytics not installed — demo/analysis mode"
 
     def read(self):
         if self.scene is not None:
@@ -656,16 +634,14 @@ class TrackingAgent:
         self.total_ids = 0
 
     def update(self, dets: List[Detection], dt: float) -> List[Track]:
-        # 1) motion prediction
-        for tr in self.tracks:
+        for tr in self.tracks:                                   # predict
             cx, cy = tr.center
             nx, ny = cx + tr.vx * dt, cy + tr.vy * dt
             w = tr.bbox[2] - tr.bbox[0]
             h = tr.bbox[3] - tr.bbox[1]
             tr.bbox = (nx - w / 2, ny - h / 2, nx + w / 2, ny + h / 2)
 
-        # 2) greedy IoU matching
-        pairs = []
+        pairs = []                                               # greedy IoU match
         for di, d in enumerate(dets):
             for ti, tr in enumerate(self.tracks):
                 v = iou((d.x1, d.y1, d.x2, d.y2), tr.bbox)
@@ -689,26 +665,16 @@ class TrackingAgent:
             tr.speed = (tr.vx ** 2 + tr.vy ** 2) ** 0.5
             tr.still_time = tr.still_time + dt if tr.speed < 10 else 0.0
 
-        # 3) unmatched detections -> new tracks
-        for di, d in enumerate(dets):
+        n_existing = len(self.tracks)
+        for di, d in enumerate(dets):                            # new tracks
             if di not in used_d:
                 self.tracks.append(Track(self.next_id, d))
                 self.next_id += 1
                 self.total_ids += 1
 
-        # 4) unmatched tracks -> miss, then prune
-        for ti, tr in enumerate(self.tracks):
-            if ti < len(used_t | set()) and ti not in used_t and ti < self.next_id:
-                if ti >= 0 and ti not in used_t and self.tracks[ti].miss >= 0:
-                    if ti not in used_d:  # index domains differ; guard below
-                        pass
-        for ti in range(len(self.tracks)):
-            matched_this = ti in used_t
-            if not matched_this and ti < len([t for t in self.tracks]) and \
-                    self.tracks[ti].hits > 0 and ti not in used_t:
-                if ti < len(used_t) or True:
-                    if ti not in used_t:
-                        self.tracks[ti].miss += 1
+        for ti in range(n_existing):                             # misses + prune
+            if ti not in used_t:
+                self.tracks[ti].miss += 1
         self.tracks = [t for t in self.tracks if t.miss <= self.max_age]
         return self.tracks
 
@@ -954,6 +920,7 @@ class Pipeline:
         self.show_zones = True
         self.show_tracks = True
         self.show_hud = True
+        self.paused = False
 
         self.timeline = deque(maxlen=CONFIG["timeline_max"])
         self.recent_events = deque(maxlen=200)
@@ -963,8 +930,13 @@ class Pipeline:
         self.fps_ema = 0.0
         self._last_hist = 0.0
         self.frames = 0
+        self.last_frame = None
+        self.last_stats: Dict = {}
 
     def step(self):
+        if self.paused and self.last_frame is not None:
+            return self.last_frame, self.last_stats
+
         now = time.time()
         dt = clamp(now - self._prev, 1 / 60, 1 / 10)
         self._prev = now
@@ -973,7 +945,8 @@ class Pipeline:
 
         frame, dets, doors, scenario = self.vision.read()
         if frame is None:
-            frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+            frame = np.zeros((CONFIG["demo_size"][1], CONFIG["demo_size"][0], 3),
+                             dtype=np.uint8)
         H, W = frame.shape[:2]
         if not self.zones.polys or self.zones.w != W:
             self.zones.configure(W, H)
@@ -1008,7 +981,9 @@ class Pipeline:
 
         self.frames += 1
         ann = self._annotate(frame, tracks, scenario, risk_index, now)
-        return ann, self._stats(tracks, doors, scenario, risk_index, now)
+        stats = self._stats(tracks, doors, scenario, risk_index, now)
+        self.last_frame, self.last_stats = ann, stats
+        return ann, stats
 
     def _annotate(self, img, tracks, scenario, risk_index, now):
         H, W = img.shape[:2]
@@ -1052,10 +1027,11 @@ class Pipeline:
             stamp = datetime.now().strftime("%H:%M:%S.") + f"{int((now % 1) * 100):02d}"
             rec = int(now * 2) % 2 == 0
             cv2.circle(out, (18, 18), 6, (60, 60, 255) if rec else (90, 90, 160), -1)
-            hud = (f"{self.camera}  |  {scenario}  |  {stamp}  |  "
+            state = "PAUSED" if self.paused else "LIVE"
+            hud = (f"{self.camera} [{state}]  |  {scenario}  |  {stamp}  |  "
                    f"FRAME {self.frames:06d}  |  FPS {self.fps_ema:4.1f}  |  "
                    f"TRACKS {len(tracks)}  |  RISK {risk_index:4.1f}")
-            cv2.putText(out, hud, (34, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+            cv2.putText(out, hud, (34, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
                         (235, 235, 235), 1, cv2.LINE_AA)
         return out
 
@@ -1098,7 +1074,7 @@ def record_demo_clip(seconds=8):
 
 
 # --------------------------------------------------------------------------
-# UI HELPERS
+# UI helpers
 # --------------------------------------------------------------------------
 def inject_css():
     st.markdown("""
@@ -1171,6 +1147,140 @@ CREATE INDEX ix_vision_events_type ON vision_events(event_type);
 
 
 # --------------------------------------------------------------------------
+# FRAGMENT RENDERERS (Streamlit-native scheduling -> works on Cloud)
+# --------------------------------------------------------------------------
+def _sync_pipeline_flags():
+    sz = st.session_state
+    pipe = sz.get("pipeline")
+    if pipe is None:
+        return None
+    pipe.show_zones = sz.get("show_zones", True)
+    pipe.show_tracks = sz.get("show_tracks", True)
+    pipe.show_hud = sz.get("show_hud", True)
+    pipe.paused = not sz.get("running", True)
+    if pipe.vision.scene is not None:
+        pipe.vision.scene.speed_mult = float(sz.get("demo_speed", 1.5))
+    return pipe
+
+
+def _render_live():
+    """One live tick: advance pipeline, render video + metrics + side rail."""
+    pipe = _sync_pipeline_flags()
+    if pipe is None:
+        st.warning("Pipeline not initialised.")
+        return
+    try:
+        frame, stats = pipe.step()
+    except Exception as e:
+        st.error(f"Pipeline error: {e}")
+        with st.expander("Traceback"):
+            st.code(traceback.format_exc())
+        return
+
+    m = st.columns(6)
+    m[0].metric("FPS", f"{stats['fps']:.1f}")
+    m[1].metric("Active Tracks", stats["tracks"])
+    m[2].metric("Active Events", len(stats["active_events"]))
+    m[3].metric("Risk Index", f"{stats['risk_index']:.0f} / 100")
+    m[4].metric("Doors Open", stats["doors_open"])
+    mm, ss = divmod(int(stats["uptime"]), 60)
+    m[5].metric("Uptime", f"{mm:02d}:{ss:02d}")
+
+    col_vid, col_side = st.columns([2.15, 1], gap="large")
+    with col_vid:
+        st.image(encode_jpg(frame), use_container_width=True)
+        state = "⏸ paused" if pipe.paused else "🟢 streaming"
+        st.caption(f"{state} · frame **{stats['frames']}** · scenario: "
+                   f"**{stats['scenario']}** · updated "
+                   f"{datetime.now().strftime('%H:%M:%S')}")
+    with col_side:
+        st.markdown("#### 🚨 Active Events")
+        evs = sorted(stats["active_events"], key=lambda e: -e.risk_score)[:6]
+        if evs:
+            now = time.time()
+            st.markdown("".join(event_card_html(e, now - e.ts) for e in evs),
+                        unsafe_allow_html=True)
+        else:
+            st.markdown("<div class='ev-card'>✅ No active events — floor nominal.</div>",
+                        unsafe_allow_html=True)
+
+        st.markdown("#### 🧠 Investigation Agent")
+        a = stats["latest_analysis"]
+        if a:
+            bg, fg = SEV_COLOR.get(a["severity"], SEV_COLOR["medium"])
+            st.markdown(f"""
+            <div class="ai-card">
+              <span class="ev-badge" style="background:{bg};color:{fg};">{a['severity'].upper()}</span>
+              <b>{a['event']}</b> · <span class="small-dim">{a['zone']} · risk {a['risk']}</span><br><br>
+              <b>Assessment:</b> {a['assessment']}<br><br>
+              <b>Recommended response:</b> {a['response']}<br><br>
+              <span class="small-dim">status: {a['status']} · agent: {stats['inv_status']} ·
+              analyses: {stats['inv_count']}</span>
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown("<div class='ai-card'>🧠 Investigation agent idle — monitoring "
+                        "structured event bus…</div>", unsafe_allow_html=True)
+
+        st.markdown("#### 📦 Object Counters")
+        chips = " &nbsp; ".join(
+            f"<span class='pill' style='background:#12203a;color:#9ec5ff;"
+            f"border:1px solid #24406b;'>{k}: {v}</span>"
+            for k, v in stats["counts"].items()) or \
+            "<span class='small-dim'>no tracked objects</span>"
+        st.markdown(chips, unsafe_allow_html=True)
+
+
+def _render_secondary(section: str):
+    pipe = st.session_state.get("pipeline")
+    if pipe is None:
+        return
+    if section == "timeline":
+        if pipe.timeline:
+            st.dataframe(pd.DataFrame(list(pipe.timeline)[:200]),
+                         use_container_width=True, height=300)
+        else:
+            st.info("No events yet — the agent pipeline will populate this timeline.")
+    elif section == "chart":
+        if len(pipe.risk_history) > 2:
+            df = pd.DataFrame(list(pipe.risk_history), columns=["t", "risk"])
+            st.line_chart(df.set_index("t"))
+        else:
+            st.info("Collecting risk samples…")
+    elif section == "system":
+        stats = pipe.last_stats or {}
+        mode = "DEMO SIMULATION" if pipe.vision.scene is not None else "LIVE SOURCE"
+        st.markdown(f"""
+        | Component | Status |
+        |---|---|
+        | Vision Agent | {stats.get('detector_status', '—')} · source: {mode} |
+        | Tracking Agent | ByteTrack-style IoU + motion model · {stats.get('tracker_status', '—')} |
+        | Zone Agent | {len(CONFIG['zones'])} virtual zones active |
+        | Event Agent | {stats.get('event_count', 0)} events emitted |
+        | Risk Agent | current index {stats.get('risk_index', 0):.0f}/100 |
+        | Investigation Agent | {stats.get('inv_status', 'IDLE')} · {stats.get('inv_count', 0)} analyses |
+        | Reporting Agent | {stats.get('db_status', '—')} |
+        | Frames processed | {stats.get('frames', 0)} |
+        """)
+
+
+HAS_FRAGMENT = hasattr(st, "fragment")
+if HAS_FRAGMENT:
+    live_tick = st.fragment(run_every=0.10)(_render_live)
+
+    def _tl(): _render_secondary("timeline")
+    def _ch(): _render_secondary("chart")
+    def _sy(): _render_secondary("system")
+
+    timeline_tick = st.fragment(run_every=2.0)(_tl)
+    chart_tick = st.fragment(run_every=2.0)(_ch)
+    system_tick = st.fragment(run_every=2.0)(_sy)
+else:
+    live_tick, timeline_tick = _render_live, lambda: _render_secondary("timeline")
+    chart_tick, system_tick = (lambda: _render_secondary("chart"),
+                               lambda: _render_secondary("system"))
+
+
+# --------------------------------------------------------------------------
 # MAIN
 # --------------------------------------------------------------------------
 def main():
@@ -1182,31 +1292,34 @@ def main():
         st.markdown("### 🛰️ Mission Control")
         source = st.radio("Video source",
                           ["Demo simulation (live)", "Webcam", "Upload video",
-                           "RTSP / IP camera"], index=0)
+                           "RTSP / IP camera"], index=0, key="src_radio")
         url_in, up_file = "", None
         if source == "RTSP / IP camera":
-            url_in = st.text_input("RTSP URL",
+            url_in = st.text_input("RTSP URL", key="rtsp_url",
                                    placeholder="rtsp://user:pass@host:554/stream")
         if source == "Upload video":
-            up_file = st.file_uploader("Video file", type=["mp4", "avi", "mov", "mkv"])
+            up_file = st.file_uploader("Video file", key="vid_up",
+                                       type=["mp4", "avi", "mov", "mkv"])
 
         st.divider()
         sz = st.session_state
         sz.setdefault("show_zones", True)
         sz.setdefault("show_tracks", True)
         sz.setdefault("show_hud", True)
-        sz["show_zones"] = st.toggle("Virtual zones overlay", value=sz["show_zones"])
+        sz.setdefault("running", True)
+        sz["show_zones"] = st.toggle("Virtual zones overlay", value=sz["show_zones"],
+                                     key="tg_zones")
         sz["show_tracks"] = st.toggle("Detection boxes + track IDs",
-                                      value=sz["show_tracks"])
-        sz["show_hud"] = st.toggle("Camera HUD", value=sz["show_hud"])
-        sz["demo_speed"] = st.slider("Demo motion speed", 0.5, 3.0, 1.5, 0.25)
+                                      value=sz["show_tracks"], key="tg_tracks")
+        sz["show_hud"] = st.toggle("Camera HUD", value=sz["show_hud"], key="tg_hud")
+        sz["demo_speed"] = st.slider("Demo motion speed", 0.5, 3.0, 1.5, 0.25,
+                                     key="sl_speed")
 
         st.divider()
         running = sz.get("running", True)
-        if st.button("⏹  Stop pipeline" if running else "▶  Start pipeline",
+        if st.button("⏹  Pause pipeline" if running else "▶  Resume pipeline",
                      use_container_width=True):
             sz["running"] = not running
-            st.rerun()
 
         if st.button("🎬  Export demo clip (MP4)", use_container_width=True):
             with st.spinner("Recording live demo feed for 8 seconds…"):
@@ -1221,9 +1334,6 @@ def main():
                    "decisions. Human oversight required.")
 
     # ---------------- pipeline (re)build ----------------
-    sz = st.session_state
-    sz.setdefault("running", True)
-
     if source.startswith("Demo"):
         desired = ("demo", "", "")
     elif source == "Webcam":
@@ -1249,22 +1359,15 @@ def main():
             stype, path, url = desired
             sz["pipeline"] = Pipeline(stype, path=path, url=url)
             sz["source_key"] = desired
-            sz["running"] = True
         except Exception as e:
             fallback_note = str(e)
             sz["pipeline"] = Pipeline("demo")
             sz["source_key"] = ("demo", "", "")
-            sz["running"] = True
 
     pipe: Pipeline = sz["pipeline"]
-    pipe.show_zones = sz["show_zones"]
-    pipe.show_tracks = sz["show_tracks"]
-    pipe.show_hud = sz["show_hud"]
-    if pipe.vision.scene is not None:
-        pipe.vision.scene.speed_mult = float(sz.get("demo_speed", 1.5))
-
     mode = "DEMO SIMULATION" if pipe.vision.scene is not None else "LIVE SOURCE"
     pill = "pill-demo" if pipe.vision.scene is not None else "pill-live"
+
     h1, h2 = st.columns([5, 1.2])
     h1.markdown(f"## 🏢 {CONFIG['app_title']}")
     h1.caption(f"{CONFIG['org']} · multi-agent vision operations · "
@@ -1275,122 +1378,30 @@ def main():
     if fallback_note:
         st.warning(f"⚠️ Requested source unavailable ({fallback_note}) — "
                    f"auto-switched to live demo simulation.")
+    if not HAS_FRAGMENT:
+        st.info("Older Streamlit detected — using full-page autorefresh mode.")
 
-    m = st.columns(6)
-    ph = {"fps": m[0].empty(), "tracks": m[1].empty(), "events": m[2].empty(),
-          "risk": m[3].empty(), "doors": m[4].empty(), "uptime": m[5].empty()}
-
-    col_vid, col_side = st.columns([2.15, 1], gap="large")
-    vid_ph = col_vid.empty()
-    live_ph = col_vid.empty()
-    with col_side:
-        st.markdown("#### 🚨 Active Events")
-        ev_ph = st.empty()
-        st.markdown("#### 🧠 Investigation Agent")
-        ai_ph = st.empty()
-        st.markdown("#### 📦 Object Counters")
-        cnt_ph = st.empty()
+    # ---------------- live area (fragment-driven; cloud-safe) ----------------
+    live_tick()
 
     tab_tl, tab_an, tab_sys, tab_schema = st.tabs(
         ["🗂 Event Timeline", "📈 Analytics", "🖥 System & Agents", "🧾 Event Schema"])
     with tab_tl:
-        tl_ph = st.empty()
+        timeline_tick()
     with tab_an:
-        ch_ph = st.empty()
+        chart_tick()
     with tab_sys:
-        sys_ph = st.empty()
+        system_tick()
     with tab_schema:
         st.markdown("**Structured event message (agent bus / DB row):**")
         st.json(SCHEMA_JSON)
         st.markdown("**PostgreSQL DDL (auto-created on boot via SQLAlchemy):**")
         st.code(DDL, language="sql")
 
-    # ---------------- live loop (exception-safe) ----------------
-    loop, consec_err = 0, 0
-    while sz.get("running", True):
-        try:
-            frame, stats = pipe.step()
-            loop += 1
-            consec_err = 0
-
-            vid_ph.image(frame, channels="BGR", use_container_width=True)
-            live_ph.caption(f"🟢 Streaming — frame **{stats['frames']}** · "
-                            f"scenario: **{stats['scenario']}** · "
-                            f"last update {datetime.now().strftime('%H:%M:%S')}")
-
-            ph["fps"].metric("FPS", f"{stats['fps']:.1f}")
-            ph["tracks"].metric("Active Tracks", stats["tracks"])
-            ph["events"].metric("Active Events", len(stats["active_events"]))
-            ph["risk"].metric("Risk Index", f"{stats['risk_index']:.0f} / 100")
-            ph["doors"].metric("Doors Open", stats["doors_open"])
-            mm, ss = divmod(int(stats["uptime"]), 60)
-            ph["uptime"].metric("Uptime", f"{mm:02d}:{ss:02d}")
-
-            evs = sorted(stats["active_events"], key=lambda e: -e.risk_score)[:6]
-            if evs:
-                now = time.time()
-                ev_ph.markdown("".join(event_card_html(e, now - e.ts) for e in evs),
-                               unsafe_allow_html=True)
-            else:
-                ev_ph.markdown("<div class='ev-card'>✅ No active events — floor nominal.</div>",
-                               unsafe_allow_html=True)
-
-            a = stats["latest_analysis"]
-            if a:
-                bg, fg = SEV_COLOR.get(a["severity"], SEV_COLOR["medium"])
-                ai_ph.markdown(f"""
-                <div class="ai-card">
-                  <span class="ev-badge" style="background:{bg};color:{fg};">{a['severity'].upper()}</span>
-                  <b>{a['event']}</b> · <span class="small-dim">{a['zone']} · risk {a['risk']}</span><br><br>
-                  <b>Assessment:</b> {a['assessment']}<br><br>
-                  <b>Recommended response:</b> {a['response']}<br><br>
-                  <span class="small-dim">status: {a['status']} · agent: {stats['inv_status']} ·
-                  analyses: {stats['inv_count']}</span>
-                </div>""", unsafe_allow_html=True)
-            else:
-                ai_ph.markdown("<div class='ai-card'>🧠 Investigation agent idle — monitoring "
-                               "structured event bus…</div>", unsafe_allow_html=True)
-
-            chips = " &nbsp; ".join(
-                f"<span class='pill' style='background:#12203a;color:#9ec5ff;"
-                f"border:1px solid #24406b;'>{k}: {v}</span>"
-                for k, v in stats["counts"].items()) or \
-                "<span class='small-dim'>no tracked objects</span>"
-            cnt_ph.markdown(chips, unsafe_allow_html=True)
-
-            if loop % 12 == 1:
-                if pipe.timeline:
-                    tl_ph.dataframe(pd.DataFrame(list(pipe.timeline)[:200]),
-                                    use_container_width=True, height=280)
-                if len(pipe.risk_history) > 2:
-                    df = pd.DataFrame(list(pipe.risk_history), columns=["t", "risk"])
-                    ch_ph.line_chart(df.set_index("t"))
-                sys_ph.markdown(f"""
-                | Component | Status |
-                |---|---|
-                | Vision Agent | {stats['detector_status']} · source: {mode} |
-                | Tracking Agent | ByteTrack-style IoU + motion model · {stats['tracker_status']} |
-                | Zone Agent | {len(CONFIG['zones'])} virtual zones active |
-                | Event Agent | {stats['event_count']} events emitted |
-                | Risk Agent | current index {stats['risk_index']:.0f}/100 |
-                | Investigation Agent | {stats['inv_status']} · {stats['inv_count']} analyses |
-                | Reporting Agent | {stats['db_status']} |
-                | Frames processed | {stats['frames']} |
-                """)
-
-            time.sleep(1.0 / CONFIG["demo_fps"] if pipe.vision.scene is not None else 0.01)
-
-        except Exception as e:
-            consec_err += 1
-            vid_ph.error(f"Pipeline error #{consec_err}: {e}")
-            st.code(traceback.format_exc())
-            if consec_err >= 10:
-                st.error("Pipeline stopped after repeated errors. Reload the page to restart.")
-                break
-            time.sleep(0.5)
-
-    if not sz.get("running", True):
-        st.info("Pipeline paused — press **Start pipeline** in the sidebar to resume.")
+    # Fallback for Streamlit versions without st.fragment
+    if not HAS_FRAGMENT:
+        time.sleep(0.10)
+        st.rerun()
 
 
 main()
